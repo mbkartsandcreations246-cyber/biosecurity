@@ -1,0 +1,255 @@
+import pandas as pd
+import json
+import streamlit as st
+from typing import Dict, List, Optional
+import io
+from utils.standards import DarwinCoreConverter, OBISStandardizer
+
+class DataIngestion:
+    """Handles multi-format data upload and initial processing"""
+    
+    def _init_(self):
+        self.supported_formats = ['.csv', '.json', '.xlsx', '.xls']
+        self.darwin_converter = DarwinCoreConverter()
+        self.obis_standardizer = OBISStandardizer()
+    
+    def upload_file(self, uploaded_file) -> Optional[pd.DataFrame]:
+        """Process uploaded file and return DataFrame"""
+        try:
+            if uploaded_file is None:
+                return None
+                
+            file_extension = uploaded_file.name.split('.')[-1].lower()
+            
+            if file_extension == 'csv':
+                df = pd.read_csv(uploaded_file)
+            elif file_extension == 'json':
+                data = json.load(uploaded_file)
+                df = pd.json_normalize(data) if isinstance(data, list) else pd.DataFrame([data])
+            elif file_extension in ['xlsx', 'xls']:
+                df = pd.read_excel(uploaded_file)
+            else:
+                st.error(f"Unsupported file format: {file_extension}")
+                return None
+                
+            return df
+            
+        except Exception as e:
+            st.error(f"Error processing file: {str(e)}")
+            return None
+    
+    def detect_data_type(self, df: pd.DataFrame) -> str:
+        """Automatically detect the type of marine data"""
+        columns = [col.lower() for col in df.columns]
+        
+        # Oceanographic data indicators
+        ocean_indicators = ['temperature', 'salinity', 'depth', 'latitude', 'longitude', 
+                          'ph', 'oxygen', 'chlorophyll', 'nutrients', 'current']
+        
+        # Fisheries data indicators
+        fish_indicators = ['species', 'abundance', 'catch', 'biomass', 'stock', 
+                         'fishing', 'vessel', 'gear']
+        
+        # Molecular/eDNA indicators
+        molecular_indicators = ['sequence', 'dna', 'edna', 'genetic', 'barcode', 
+                              'pcr', 'amplicon', 'gene']
+        
+        # Taxonomy indicators
+        taxonomy_indicators = ['taxonomy', 'classification', 'kingdom', 'phylum', 
+                             'class', 'order', 'family', 'genus', 'otolith']
+        
+        # Count matches
+        ocean_score = sum(1 for col in columns if any(ind in col for ind in ocean_indicators))
+        fish_score = sum(1 for col in columns if any(ind in col for ind in fish_indicators))
+        molecular_score = sum(1 for col in columns if any(ind in col for ind in molecular_indicators))
+        taxonomy_score = sum(1 for col in columns if any(ind in col for ind in taxonomy_indicators))
+        
+        scores = {
+            'Oceanographic': ocean_score,
+            'Fisheries': fish_score,
+            'Molecular/eDNA': molecular_score,
+            'Taxonomy': taxonomy_score
+        }
+        
+        return max(scores, key=scores.get) if max(scores.values()) > 0 else 'Unknown'
+    
+    def validate_data(self, df: pd.DataFrame, data_type: str) -> Dict[str, List[str]]:
+        """Validate data quality and completeness"""
+        issues = {
+            'errors': [],
+            'warnings': [],
+            'suggestions': []
+        }
+        
+        # Basic validation
+        if df.empty:
+            issues['errors'].append("Dataset is empty")
+            return issues
+        
+        # Check for missing values
+        missing_percent = (df.isnull().sum() / len(df) * 100)
+        high_missing = missing_percent[missing_percent > 50]
+        if not high_missing.empty:
+            issues['warnings'].extend([f"Column '{col}' has {pct:.1f}% missing values" 
+                                     for col, pct in high_missing.items()])
+        
+        # Data type specific validation
+        if data_type == 'Oceanographic':
+            self._validate_oceanographic(df, issues)
+        elif data_type == 'Fisheries':
+            self._validate_fisheries(df, issues)
+        elif data_type == 'Molecular/eDNA':
+            self._validate_molecular(df, issues)
+        elif data_type == 'Taxonomy':
+            self._validate_taxonomy(df, issues)
+        
+        return issues
+    
+    def _validate_oceanographic(self, df: pd.DataFrame, issues: Dict[str, List[str]]):
+        """Validate oceanographic data"""
+        required_fields = ['latitude', 'longitude']
+        columns = [col.lower() for col in df.columns]
+        
+        for field in required_fields:
+            if not any(field in col for col in columns):
+                issues['errors'].append(f"Missing required field: {field}")
+        
+        # Check coordinate ranges
+        for col in df.columns:
+            if 'lat' in col.lower():
+                if df[col].min() < -90 or df[col].max() > 90:
+                    issues['errors'].append(f"Invalid latitude values in {col}")
+            elif 'lon' in col.lower():
+                if df[col].min() < -180 or df[col].max() > 180:
+                    issues['errors'].append(f"Invalid longitude values in {col}")
+    
+    def _validate_fisheries(self, df: pd.DataFrame, issues: Dict[str, List[str]]):
+        """Validate fisheries data"""
+        columns = [col.lower() for col in df.columns]
+        
+        if not any('species' in col for col in columns):
+            issues['warnings'].append("No species column identified")
+        
+        if not any(term in col for col in columns for term in ['abundance', 'catch', 'biomass']):
+            issues['warnings'].append("No abundance/catch data identified")
+    
+    def _validate_molecular(self, df: pd.DataFrame, issues: Dict[str, List[str]]):
+        """Validate molecular/eDNA data"""
+        columns = [col.lower() for col in df.columns]
+        
+        if not any('sequence' in col for col in columns):
+            issues['warnings'].append("No sequence data identified")
+        
+        # Check sequence format
+        for col in df.columns:
+            if 'sequence' in col.lower():
+                sequences = df[col].dropna()
+                invalid_sequences = sequences[~sequences.str.match(r'^[ATCGN]+$', na=False)]
+                if not invalid_sequences.empty:
+                    issues['warnings'].append(f"Invalid DNA sequences found in {col}")
+    
+    def _validate_taxonomy(self, df: pd.DataFrame, issues: Dict[str, List[str]]):
+        """Validate taxonomy data"""
+        columns = [col.lower() for col in df.columns]
+        
+        taxonomic_levels = ['kingdom', 'phylum', 'class', 'order', 'family', 'genus', 'species']
+        found_levels = [level for level in taxonomic_levels if any(level in col for col in columns)]
+        
+        if len(found_levels) < 2:
+            issues['warnings'].append("Limited taxonomic hierarchy detected")
+    
+    def standardize_data(self, df: pd.DataFrame, data_type: str) -> pd.DataFrame:
+        """Apply data standardization based on type"""
+        try:
+            if data_type == 'Oceanographic':
+                return self.obis_standardizer.standardize_oceanographic(df)
+            elif data_type in ['Fisheries', 'Taxonomy']:
+                return self.darwin_converter.convert_to_darwin_core(df)
+            elif data_type == 'Molecular/eDNA':
+                return self._standardize_molecular(df)
+            else:
+                return df
+        except Exception as e:
+            st.error(f"Error during standardization: {str(e)}")
+            return df
+    
+    def _standardize_molecular(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Standardize molecular/eDNA data"""
+        standardized = df.copy()
+        
+        # Standardize column names
+        column_mapping = {
+            'dna_sequence': 'sequence',
+            'dna_barcode': 'sequence',
+            'species_name': 'scientificName',
+            'sample_id': 'catalogNumber',
+            'collection_date': 'eventDate',
+            'lat': 'decimalLatitude',
+            'lon': 'decimalLongitude'
+        }
+        
+        for old_name, new_name in column_mapping.items():
+            matching_cols = [col for col in standardized.columns if old_name.lower() in col.lower()]
+            if matching_cols:
+                standardized = standardized.rename(columns={matching_cols[0]: new_name})
+        
+        # Clean sequences (remove whitespace, convert to uppercase)
+        if 'sequence' in standardized.columns:
+            standardized['sequence'] = standardized['sequence'].str.replace(r'\s+', '', regex=True).str.upper()
+        
+        return standardized
+    
+    def generate_metadata(self, df: pd.DataFrame, data_type: str, filename: str) -> Dict:
+        """Generate metadata for the dataset"""
+        metadata = {
+            'filename': filename,
+            'data_type': data_type,
+            'record_count': len(df),
+            'column_count': len(df.columns),
+            'columns': list(df.columns),
+            'upload_timestamp': pd.Timestamp.now().isoformat(),
+            'data_quality': {
+                'completeness': (1 - df.isnull().sum().sum() / (len(df) * len(df.columns))) * 100,
+                'duplicate_records': df.duplicated().sum()
+            }
+        }
+        
+        # Add data type specific metadata
+        if data_type == 'Oceanographic':
+            if any(col for col in df.columns if 'lat' in col.lower()):
+                metadata['spatial_extent'] = self._get_spatial_extent(df)
+            if any(col for col in df.columns if 'date' in col.lower() or 'time' in col.lower()):
+                metadata['temporal_extent'] = self._get_temporal_extent(df)
+        
+        return metadata
+    
+    def _get_spatial_extent(self, df: pd.DataFrame) -> Dict:
+        """Calculate spatial extent of the data"""
+        lat_cols = [col for col in df.columns if 'lat' in col.lower()]
+        lon_cols = [col for col in df.columns if 'lon' in col.lower()]
+        
+        if lat_cols and lon_cols:
+            lat_col, lon_col = lat_cols[0], lon_cols[0]
+            return {
+                'min_latitude': df[lat_col].min(),
+                'max_latitude': df[lat_col].max(),
+                'min_longitude': df[lon_col].min(),
+                'max_longitude': df[lon_col].max()
+            }
+        return {}
+    
+    def _get_temporal_extent(self, df: pd.DataFrame) -> Dict:
+        """Calculate temporal extent of the data"""
+        date_cols = [col for col in df.columns if any(term in col.lower() for term in ['date', 'time'])]
+        
+        if date_cols:
+            date_col = date_cols[0]
+            try:
+                dates = pd.to_datetime(df[date_col], errors='coerce')
+                return {
+                    'start_date': dates.min().isoformat(),
+                    'end_date': dates.max().isoformat()
+                }
+            except:
+                pass
+        return {}
